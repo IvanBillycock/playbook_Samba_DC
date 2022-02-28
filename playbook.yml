@@ -1,0 +1,155 @@
+- name: Install Samba DC to Debian
+  hosts: debian
+  become: yes
+  become_method: su
+  vars:
+    source_key: ./{{ domain }}.key
+    source_crt: ./{{ domain }}.pem
+    source_ca: ./flexberry.crt
+    dest_crt: /var/lib/samba/private/tls/{{ domain }}.pem
+    dest_key: /var/lib/samba/private/tls/{{ domain }}.key
+    dest_ca: /var/lib/samba/private/tls/flexberry.crt
+    realm: "{{ domain | upper }}"
+    samba_domain: "{{ realm | split('.') }}"
+  tasks:
+
+  - name: Install dependency
+    apt:
+      name:
+        - acl
+        - attr
+        - samba
+        - samba-dsdb-modules
+        - samba-vfs-modules
+        - winbind
+        - libpam-winbind
+        - libnss-winbind
+        - libpam-krb5
+        - krb5-config
+        - krb5-user
+      state: present
+      update_cache: yes
+    environment:
+      DEBIAN_FRONTEND: noninteractive
+
+  - name: read smb.conf
+    shell: cat /etc/samba/smb.conf
+    register: smb_conf
+    ignore_errors: yes
+
+  - name: Delete smb.conf
+    when: smb_conf.stdout.find('#by ansible') != 0
+    file:
+      path: /etc/samba/smb.conf
+      state: absent
+
+  - name: DC configure
+    shell: samba-tool domain provision --server-role=dc --use-rfc2307 --dns-backend=SAMBA_INTERNAL --realm={{ realm }} --domain={{ samba_domain }} --adminpass={{ password }}
+    ignore_errors: yes
+
+  - name: Copy file krb5
+    when: smb_conf.changed
+    copy:
+      src: /var/lib/samba/private/krb5.conf
+      dest: /etc/krb5.conf
+
+#  - name: edit dhclient.conf
+#    lineinfile:
+#      dest: /etc/dhcp/dhclient.conf
+#      insertafter: '^#supersede domain-name'
+#      line: '{{ item }}'
+#    with_items:
+#      - 'supersede domain-name "example.com";'
+#      - 'supersede domain-search "example.com";'
+#      - 'supersede domain-name-servers 127.0.0.1;'
+#    register: dhclient
+#
+#  - name: reload dhclient
+#    when: dhclient.changed
+#    shell: dhclient -r; dhclient
+
+  - name: edit hosts
+    lineinfile:
+      dest: /etc/hosts
+      line: '{{ item }}'
+    with_items:
+      - "127.0.0.1\t{{ domain }}"
+      - "127.0.0.1\tdc.{{ domain }}"
+
+  - name: should be masked
+    systemd:
+      name: '{{ item }}'
+      enabled: no
+      masked: yes
+    with_items:
+      - smbd
+      - nmbd
+      - winbind
+
+  - name: Install SSL certificate
+    copy:
+      src: "{{ source_crt }}" 
+      dest: "{{ dest_crt }}"
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: Install SSL private key
+    copy:
+      src: "{{ source_key }}" 
+      dest: "{{ dest_key }}"
+      owner: root
+      group: root
+      mode: 0400
+
+  - name: Install SSL private CA
+    copy:
+      src: "{{ source_ca }}" 
+      dest: "{{ dest_ca }}"
+
+  - name: edit smb.conf
+    lineinfile:
+      dest: /etc/samba/smb.conf
+      insertafter: '^\tidmap_ldb'
+      line: '{{ item }}'
+    with_items:
+      - "\tntlm auth = mschapv2-and-ntlmv2-only"
+      - "\tldap server require strong auth =no"
+      - "\tapply group policies = yes"
+      - "\ttls enabled = yes"
+      - "\ttls keyfile = tls/{{ domain }}.key"
+      - "\ttls certfile = tls/{{ domain }}.pem"
+      - "\ttls cafile = tls/flexberry.crt"
+    register: edited_smb
+
+  - name: ansible print
+    when: edited_smb.changed
+    lineinfile:
+      dest: /etc/samba/smb.conf
+      insertbefore: '^# Global'
+      line: '#by ansible'
+
+  - name: add CA
+    copy:
+      src: '{{  source_ca  }}'
+      dest: /usr/local/share/ca-certificates/flexberry.crt
+
+  - name: update CA
+    shell: update-ca-certificates
+
+  - name: Copy samba service
+    copy:
+      src: ./samba-ad-dc.service
+      dest: /etc/systemd/system/samba-ad-dc.service
+      mode: 0775
+      owner: root
+      group: root
+
+  - name: Enable samba service
+    service:
+      name: samba-ad-dc.service
+      enabled: yes
+
+  - name: reboot the machine
+    when: edited_smb.changed
+    reboot:
